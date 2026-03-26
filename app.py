@@ -17,8 +17,18 @@ import plotly.graph_objects as go
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SYMBOL   = "BTCUSDT"
-BINANCE  = "https://api.binance.com/api/v3"
 BET_SIZE = 10.0
+
+# Endpoints en orden de prioridad (fallback automático si alguno da 451/403)
+_BINANCE_ENDPOINTS = [
+    "https://api.binance.com/api/v3",
+    "https://api1.binance.com/api/v3",
+    "https://api2.binance.com/api/v3",
+    "https://api3.binance.com/api/v3",
+    "https://api4.binance.com/api/v3",
+    "https://api.binance.us/api/v3",   # Binance US (símbolo idéntico)
+]
+BINANCE = _BINANCE_ENDPOINTS[0]  # se sobreescribe en runtime si falla
 
 TIER_DEF = {
     "S": {"min_volume": 500, "min_abs_move": 0.3},
@@ -39,26 +49,62 @@ _CST_DELTA = timedelta(hours=-6)
 # DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _try_fetch_page(base_url: str, interval: str, current: int,
+                    end_ms: int) -> list:
+    """Intenta descargar una página de klines desde un endpoint dado."""
+    r = requests.get(
+        f"{base_url}/klines",
+        params={"symbol": SYMBOL, "interval": interval,
+                "startTime": current, "endTime": end_ms, "limit": 1000},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def fetch_klines_range(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Descarga klines probando endpoints alternativos si el principal da 451/403."""
     all_rows = []
     current  = start_ms
+    active_url = None  # endpoint que funcionó
+
     while current < end_ms:
-        r = requests.get(
-            f"{BINANCE}/klines",
-            params={"symbol": SYMBOL, "interval": interval,
-                    "startTime": current, "endTime": end_ms, "limit": 1000},
-            timeout=15,
-        )
-        r.raise_for_status()
-        rows = r.json()
+        rows = None
+        last_err = None
+
+        # Intentar cada endpoint hasta que uno funcione
+        for endpoint in _BINANCE_ENDPOINTS:
+            try:
+                rows = _try_fetch_page(endpoint, interval, current, end_ms)
+                active_url = endpoint
+                break
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code in (451, 403):
+                    last_err = e
+                    continue   # probar el siguiente endpoint
+                raise          # otro error HTTP → relanzar
+            except Exception as e:
+                last_err = e
+                continue
+
+        if rows is None:
+            raise ConnectionError(
+                f"Ningún endpoint de Binance respondió correctamente.\n"
+                f"Último error: {last_err}\n"
+                "Si estás en EE.UU. o región bloqueada, usa una VPN o "
+                "despliega la app en un servidor sin restricciones geográficas."
+            )
+
         if not rows:
             break
         all_rows.extend(rows)
         current = rows[-1][6] + 1
         if len(rows) < 1000:
             break
+
     if not all_rows:
         return pd.DataFrame()
+
     cols = ["open_time","open","high","low","close","volume",
             "close_time","qvol","trades","tb","tq","ignore"]
     df = pd.DataFrame(all_rows, columns=cols)
