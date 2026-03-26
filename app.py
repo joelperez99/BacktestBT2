@@ -736,6 +736,58 @@ def run_backtest_month(year_str: str, month_str: str, filters: dict,
             "label": f"{year_str}-{month_str}", "mode": "month"}
 
 
+def run_backtest_year(year_str: str, filters: dict, progress_cb=None) -> dict:
+    year         = int(year_str)
+    year_start   = pd.Timestamp(year=year, month=1, day=1, tz="UTC")
+    year_end     = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
+    warmup_start = year_start - pd.Timedelta(hours=2)
+    fetch_end    = year_end   + pd.Timedelta(minutes=10)
+    start_ms     = int(warmup_start.value // 1_000_000)
+    end_ms       = int(fetch_end.value    // 1_000_000)
+
+    if progress_cb:
+        progress_cb("Cargando datos 1m y 5m del año…", 0.02)
+    df1m = fetch_and_cache("1m", start_ms, end_ms)
+    df5m = fetch_and_cache("5m", start_ms, end_ms)
+    if df1m.empty or df5m.empty:
+        raise ValueError("No se obtuvieron datos para ese año.")
+
+    all_records = []
+    for month in range(1, 13):
+        month_start = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
+        last_day    = cal_lib.monthrange(year, month)[1]
+        month_end_t = month_start + pd.Timedelta(days=last_day)
+
+        df5m_month = df5m[
+            (df5m["open_time"] >= month_start) &
+            (df5m["open_time"] <  month_end_t + pd.Timedelta(minutes=10))
+        ].reset_index(drop=True)
+
+        for idx in range(last_day):
+            day_ts     = month_start + pd.Timedelta(days=idx)
+            day_end_ts = day_ts + pd.Timedelta(days=1)
+            df5m_day   = df5m_month[
+                (df5m_month["open_time"] >= day_ts) &
+                (df5m_month["open_time"] <  day_end_ts + pd.Timedelta(minutes=5))
+            ].reset_index(drop=True)
+            if not df5m_day.empty:
+                all_records.extend(_process_candles(df5m_day, df1m, filters))
+
+        if progress_cb:
+            month_names = ["Ene","Feb","Mar","Abr","May","Jun",
+                           "Jul","Ago","Sep","Oct","Nov","Dic"]
+            progress_cb(f"Procesado {month_names[month-1]} {year} ({month}/12)",
+                        0.05 + 0.90 * month / 12)
+
+    if not all_records:
+        raise ValueError("No hay velas procesables para ese año.")
+
+    df    = pd.DataFrame(all_records)
+    stats = _compute_stats(df)
+    return {"records": all_records, "df": df, "stats": stats,
+            "label": year_str, "mode": "year"}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EXCEL (bytes para download_button)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1028,25 +1080,31 @@ with st.sidebar:
         unsafe_allow_html=True)
     st.divider()
 
-    mode = st.radio("Modo", ["Por día", "Por mes"], horizontal=True)
+    mode = st.radio("Modo", ["Por día", "Por mes", "Por año"], horizontal=True)
 
     today  = datetime.now()
     years  = list(range(today.year - 2, today.year + 1))
     months = list(range(1, 13))
 
-    cy, cm = st.columns(2)
-    with cy:
-        year_sel  = st.selectbox("Año",  years,  index=len(years)-1)
-    with cm:
-        month_sel = st.selectbox("Mes",  months, index=today.month - 1,
-                                  format_func=lambda m: f"{m:02d}")
-
-    if mode == "Por día":
-        days_in_month = cal_lib.monthrange(year_sel, month_sel)[1]
-        default_day   = min(today.day - 1, days_in_month - 1)
-        day_sel = st.selectbox("Día", list(range(1, days_in_month + 1)),
-                                index=max(0, default_day - 1),
-                                format_func=lambda d: f"{d:02d}")
+    if mode == "Por año":
+        year_sel  = st.selectbox("Año", years, index=len(years)-1)
+        month_sel = 1   # no usado
+        day_sel   = 1   # no usado
+    else:
+        cy, cm = st.columns(2)
+        with cy:
+            year_sel  = st.selectbox("Año", years, index=len(years)-1)
+        with cm:
+            month_sel = st.selectbox("Mes", months, index=today.month - 1,
+                                      format_func=lambda m: f"{m:02d}")
+        if mode == "Por día":
+            days_in_month = cal_lib.monthrange(year_sel, month_sel)[1]
+            default_day   = min(today.day - 1, days_in_month - 1)
+            day_sel = st.selectbox("Día", list(range(1, days_in_month + 1)),
+                                    index=max(0, default_day - 1),
+                                    format_func=lambda d: f"{d:02d}")
+        else:
+            day_sel = 1  # no usado
 
     st.divider()
     st.markdown("**Filtros de señal**")
@@ -1174,15 +1232,30 @@ if run_btn:
                 st.session_state["result"] = result
             except Exception as e:
                 st.error(f"Error: {e}")
-    else:
+
+    elif mode == "Por mes":
         year_s  = f"{year_sel:04d}"
         month_s = f"{month_sel:02d}"
         prog    = st.progress(0, text="Descargando datos del mes…")
-        def _prog_cb(done, total):
+        def _prog_cb_m(done, total):
             prog.progress(done / total, text=f"Procesando día {done}/{total}…")
         try:
-            result = run_backtest_month(year_s, month_s, filters, _prog_cb)
+            result = run_backtest_month(year_s, month_s, filters, _prog_cb_m)
             st.session_state["result"] = result
+            prog.empty()
+        except Exception as e:
+            prog.empty()
+            st.error(f"Error: {e}")
+
+    else:  # Por año
+        year_s = f"{year_sel:04d}"
+        prog   = st.progress(0.0, text=f"Iniciando backtest año {year_s}…")
+        def _prog_cb_y(msg, pct):
+            prog.progress(min(pct, 1.0), text=msg)
+        try:
+            result = run_backtest_year(year_s, filters, _prog_cb_y)
+            st.session_state["result"] = result
+            prog.progress(1.0, text=f"✅ Año {year_s} completado")
             prog.empty()
         except Exception as e:
             prog.empty()
@@ -1199,8 +1272,10 @@ if "result" in st.session_state:
     tier_label = "+".join(selected_tiers) if selected_tiers else "ninguno"
 
     # ── Resumen global ──────────────────────────────────────────────────────
-    st.markdown(f"<div class='section-hdr'>📊 Backtest v2 — {result['label']}"
-                f"{'  ·  '+str(n_days)+' días' if mode_r=='month' else ''}</div>",
+    extra = ""
+    if mode_r == "month": extra = f"  ·  {n_days} días"
+    if mode_r == "year":  extra = f"  ·  {n_days} días  ·  {df_main['date'].str[:7].nunique()} meses"
+    st.markdown(f"<div class='section-hdr'>📊 Backtest v2 — {result['label']}{extra}</div>",
                 unsafe_allow_html=True)
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("Total velas",          s["total"])
@@ -1491,6 +1566,140 @@ if "result" in st.session_state:
                 key="day_detail_sel")
             if sel_day != "— elige un día —":
                 render_day_detail(df_main, sel_day, selected_tiers, stake)
+
+    # ── Calendario anual (12 meses) ──────────────────────────────────────────
+    if mode_r == "year":
+        MONTH_NAMES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio",
+                       "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+        MONTH_SHORT = ["Ene","Feb","Mar","Abr","May","Jun",
+                       "Jul","Ago","Sep","Oct","Nov","Dic"]
+        yr_y = result["label"]
+
+        filt_df_yr = (df_main[df_main["tier"].isin(selected_tiers)].copy()
+                      if selected_tiers else df_main.iloc[0:0].copy())
+        by_month: dict = {}
+        for mo_key, grp in filt_df_yr.groupby(filt_df_yr["date"].str[:7]):
+            w = int(grp["correct"].sum()); t = len(grp)
+            by_month[mo_key] = {
+                "wins": w, "losses": t - w, "total": t,
+                "pnl": (w - (t - w)) * stake,
+                "acc": w / t * 100 if t > 0 else 0,
+            }
+
+        # Resumen anual
+        if by_month:
+            total_pnl_y  = sum(v["pnl"]   for v in by_month.values())
+            mo_gain_y    = sum(1 for v in by_month.values() if v["pnl"] > 0)
+            mo_loss_y    = sum(1 for v in by_month.values() if v["pnl"] < 0)
+            best_mo_y    = max(by_month, key=lambda k: by_month[k]["pnl"])
+            worst_mo_y   = min(by_month, key=lambda k: by_month[k]["pnl"])
+        else:
+            total_pnl_y = mo_gain_y = mo_loss_y = 0
+            best_mo_y = worst_mo_y = None
+
+        st.markdown(
+            f"<div class='section-hdr'>📅 Calendario Anual {yr_y} — "
+            f"${stake:.0f}/trade · Tiers: {tier_label}</div>",
+            unsafe_allow_html=True)
+
+        ya1,ya2,ya3,ya4,ya5 = st.columns(5)
+        ya1.metric("P&L Total Año",   f"${total_pnl_y:+,.0f}")
+        ya2.metric("Meses ganancia",  mo_gain_y)
+        ya3.metric("Meses pérdida",   mo_loss_y)
+        ya4.metric("Mejor mes",
+                   (f"{MONTH_SHORT[int(best_mo_y.split('-')[1])-1]} "
+                    f"(${by_month[best_mo_y]['pnl']:+,.0f})")
+                   if best_mo_y else "—")
+        ya5.metric("Peor mes",
+                   (f"{MONTH_SHORT[int(worst_mo_y.split('-')[1])-1]} "
+                    f"(${by_month[worst_mo_y]['pnl']:+,.0f})")
+                   if worst_mo_y else "—")
+
+        # Grid 4 filas × 3 cols
+        for row_i in range(4):
+            cols_y = st.columns(3)
+            for col_i in range(3):
+                m      = row_i * 3 + col_i + 1
+                mo_key = f"{yr_y}-{m:02d}"
+                info   = by_month.get(mo_key)
+                with cols_y[col_i]:
+                    if info:
+                        pv  = info["pnl"]
+                        pc  = "#00d68f" if pv > 0 else "#ff4757"
+                        acc = info["acc"]
+                        ac  = "#00d68f" if acc >= 55 else ("#ff4757" if acc < 50 else "#a0a3b1")
+                        st.markdown(f"""
+                        <div style='background:#161929;border:2px solid {pc};
+                                    border-radius:10px;padding:14px;text-align:center;
+                                    margin-bottom:8px;'>
+                          <div style='color:#e8eaf6;font-size:15px;font-weight:bold;'>
+                            {MONTH_NAMES[m-1]}</div>
+                          <div style='color:{pc};font-size:26px;font-weight:bold;'>
+                            ${pv:+,.0f}</div>
+                          <div style='color:{ac};font-size:13px;'>{acc:.1f}%</div>
+                          <div style='color:#6e7191;font-size:11px;'>
+                            {info["wins"]}W / {info["losses"]}L · {info["total"]} trades</div>
+                        </div>""", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style='background:#0d0f1a;border:1px solid #1e2236;
+                                    border-radius:10px;padding:14px;text-align:center;
+                                    opacity:0.4;margin-bottom:8px;'>
+                          <div style='color:#6e7191;font-size:15px;'>{MONTH_NAMES[m-1]}</div>
+                          <div style='color:#6e7191;font-size:22px;'>—</div>
+                        </div>""", unsafe_allow_html=True)
+
+        # Selector de mes para ver detalle mensual
+        if by_month:
+            st.markdown("<div class='section-hdr'>🔍 Detalle de Mes</div>",
+                        unsafe_allow_html=True)
+            month_options = sorted(by_month.keys())
+            sel_mo = st.selectbox("Seleccionar mes para detalle:",
+                                  ["— elige un mes —"] + month_options,
+                                  key="year_month_sel")
+            if sel_mo != "— elige un mes —":
+                # Mostrar días de ese mes como calendario
+                mo_df = df_main[df_main["date"].str[:7] == sel_mo]
+                filt_mo = (mo_df[mo_df["tier"].isin(selected_tiers)]
+                           if selected_tiers else mo_df.iloc[0:0])
+                by_date_mo: dict = {}
+                for ds, grp in filt_mo.groupby("date"):
+                    w = int(grp["correct"].sum()); t = len(grp)
+                    by_date_mo[ds] = {"wins": w, "losses": t-w, "total": t,
+                                      "pnl": (w-(t-w))*stake}
+
+                yr_mo, mo_mo = int(sel_mo.split("-")[0]), int(sel_mo.split("-")[1])
+                month_weeks_d = cal_lib.monthcalendar(yr_mo, mo_mo)
+                day_names_s   = ["L","M","X","J","V","S","D"]
+                cal_mo_html   = ("<div style='display:grid;grid-template-columns:repeat(7,1fr);"
+                                 "gap:4px;margin-top:8px;'>")
+                for dn in day_names_s:
+                    cal_mo_html += (f"<div style='text-align:center;color:#6e7191;"
+                                    f"font-size:11px;font-weight:bold;padding:2px;'>{dn}</div>")
+                for week in month_weeks_d:
+                    for day in week:
+                        if day == 0:
+                            cal_mo_html += "<div></div>"; continue
+                        ds   = f"{yr_mo:04d}-{mo_mo:02d}-{day:02d}"
+                        info = by_date_mo.get(ds)
+                        if info:
+                            pv = info["pnl"]
+                            pc = "#00d68f" if pv > 0 else "#ff4757"
+                            cal_mo_html += (
+                                f"<div style='background:#161929;border:1px solid {pc};"
+                                f"border-radius:6px;padding:6px 2px;text-align:center;'>"
+                                f"<div style='color:#6e7191;font-size:9px;text-align:right;'>{day}</div>"
+                                f"<div style='color:{pc};font-size:12px;font-weight:bold;'>${pv:+,.0f}</div>"
+                                f"<div style='color:#6e7191;font-size:8px;'>{info['wins']}W/{info['losses']}L</div>"
+                                f"</div>")
+                        else:
+                            cal_mo_html += (
+                                f"<div style='background:#0d0f1a;border:1px solid #1e2236;"
+                                f"border-radius:6px;padding:6px 2px;text-align:center;opacity:0.3;'>"
+                                f"<div style='color:#6e7191;font-size:9px;text-align:right;'>{day}</div>"
+                                f"<div style='color:#6e7191;font-size:11px;'>—</div></div>")
+                cal_mo_html += "</div>"
+                st.markdown(cal_mo_html, unsafe_allow_html=True)
 
     # ── Detalle automático (modo día) ────────────────────────────────────────
     if mode_r == "day":
