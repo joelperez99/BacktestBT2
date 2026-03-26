@@ -139,33 +139,29 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     stats = get_db_stats(interval)
     interval_ms = 60_000 if interval == "1m" else 300_000
 
-    missing_start = None
-    missing_end   = None
-
     if stats["count"] == 0:
         # DB vacía → descargar todo el rango
-        missing_start, missing_end = start_ms, end_ms
+        new_df = fetch_klines_range(interval, start_ms, end_ms)
+        if not new_df.empty:
+            insert_klines_db(interval, new_df)
     else:
+        db_min = stats["min_ms"]
+        db_max = stats["max_ms"]
+
         # Verificar si falta el inicio del rango
-        if stats["min_ms"] > start_ms:
-            missing_start = start_ms
-            missing_end   = stats["min_ms"]
-            # Fetch tramo inicial faltante
-            new_df = fetch_klines_range(interval, missing_start, missing_end)
+        if db_min > start_ms:
+            new_df = fetch_klines_range(interval, start_ms, db_min)
             if not new_df.empty:
                 insert_klines_db(interval, new_df)
 
         # Verificar si falta el final del rango
-        if stats["max_ms"] < end_ms - interval_ms:
-            fetch_from = max(stats["max_ms"] + 1, start_ms)
+        # Usamos margen de 2 velas para no re-descargar por latencia del último candle
+        if db_max < end_ms - interval_ms * 2:
+            fetch_from = max(db_max + 1, start_ms)
             new_df = fetch_klines_range(interval, fetch_from, end_ms)
             if not new_df.empty:
                 insert_klines_db(interval, new_df)
-
-    if missing_start is not None and missing_end is not None:
-        new_df = fetch_klines_range(interval, missing_start, missing_end)
-        if not new_df.empty:
-            insert_klines_db(interval, new_df)
+        # Si el rango está completamente cubierto, no se hace ninguna llamada a Binance
 
     return load_from_db(interval, start_ms, end_ms)
 
