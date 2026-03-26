@@ -720,14 +720,44 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+/* ── Fondo general ── */
 .stApp { background-color: #0d0f1a; }
+
+/* ── Sidebar ── */
 section[data-testid="stSidebar"] { background-color: #161929; }
+section[data-testid="stSidebar"] * { color: #e8eaf6 !important; }
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span { color: #e8eaf6 !important; font-size: 13px !important; }
+section[data-testid="stSidebar"] .stRadio > label { color: #b0b3c8 !important; font-weight: 600 !important; }
+section[data-testid="stSidebar"] .stSelectbox > label,
+section[data-testid="stSidebar"] .stNumberInput > label,
+section[data-testid="stSidebar"] .stCheckbox > label { color: #c8cbe0 !important; font-weight: 600 !important; }
+section[data-testid="stSidebar"] [data-baseweb="select"] div,
+section[data-testid="stSidebar"] input { color: #e8eaf6 !important; background-color: #1e2236 !important; }
+section[data-testid="stSidebar"] .stDivider { border-color: #2a2d45 !important; }
+section[data-testid="stSidebar"] .stButton > button {
+    background-color: #7c6fff !important; color: #ffffff !important;
+    border: none !important; font-weight: bold !important;
+}
+section[data-testid="stSidebar"] .stButton > button:hover {
+    background-color: #9d8fff !important;
+}
+
+/* ── Métricas ── */
 div[data-testid="metric-container"] {
     background-color: #161929;
     border: 1px solid #1e2236;
     border-radius: 8px;
     padding: 12px 16px;
 }
+div[data-testid="metric-container"] label { color: #8a8daa !important; }
+div[data-testid="metric-container"] [data-testid="stMetricValue"] { color: #e8eaf6 !important; }
+
+/* ── Texto general ── */
+.stApp p, .stApp span, .stApp div { color: #e8eaf6; }
+
+/* ── Sección header ── */
 .section-hdr {
     font-size: 14px; font-weight: bold; color: #7c6fff;
     border-bottom: 1px solid #1e2236;
