@@ -836,6 +836,21 @@ def save_excel_detail_bytes(result: dict) -> bytes:
 # UI HELPER — DETALLE DE DÍA
 # ══════════════════════════════════════════════════════════════════════════════
 
+def find_daily_limit_hit(day_df: pd.DataFrame, stake: float, limit: float) -> dict:
+    """
+    Simula el P&L acumulado trade a trade en un día.
+    Retorna qué límite (+ o -) se alcanzó primero, en qué operación y con qué monto.
+    """
+    running = 0.0
+    for i, (_, row) in enumerate(day_df.iterrows()):
+        running += stake if row["correct"] else -stake
+        if running >= limit:
+            return {"hit": "UP",   "amount": running, "op": i + 1, "time": row["time"]}
+        if running <= -limit:
+            return {"hit": "DOWN", "amount": running, "op": i + 1, "time": row["time"]}
+    return {"hit": None, "amount": running, "op": None, "time": None}
+
+
 def render_day_detail(df_main: pd.DataFrame, date_str: str,
                       sel_tiers: list, stake: float):
     day_df = df_main[
@@ -1360,6 +1375,40 @@ if "result" in st.session_state:
                    (f"Día {worst_date_c.split('-')[2]} (${worst_pnl_c:+,.0f})"
                     if worst_date_c else "—"))
 
+        # ── Filtro límite diario ─────────────────────────────────────────
+        lim_col1, lim_col2 = st.columns([1, 3])
+        with lim_col1:
+            use_limit = st.checkbox("🎯 Filtro límite diario ±$", value=False,
+                                     key="use_limit_filter")
+        with lim_col2:
+            daily_limit = st.number_input(
+                "Límite ±$", value=500.0, step=100.0, min_value=1.0,
+                key="daily_limit_val",
+                label_visibility="collapsed" if not use_limit else "visible",
+                disabled=not use_limit)
+
+        # Pre-calcular límites por día si el filtro está activo
+        limit_results: dict = {}
+        if use_limit and selected_tiers:
+            for ds, grp in filt_df_cal.groupby("date"):
+                day_sorted = grp.sort_values("time").reset_index(drop=True)
+                limit_results[ds] = find_daily_limit_hit(day_sorted, stake, daily_limit)
+
+            # Resumen de límites
+            hit_up   = sum(1 for v in limit_results.values() if v["hit"] == "UP")
+            hit_down = sum(1 for v in limit_results.values() if v["hit"] == "DOWN")
+            hit_none = sum(1 for v in limit_results.values() if v["hit"] is None)
+            st.markdown(
+                f"<div style='background:#1e2236;border-radius:8px;padding:10px 16px;"
+                f"margin:8px 0;font-size:13px;'>"
+                f"<span style='color:#00d68f;font-weight:bold;'>🟢 +${daily_limit:,.0f} primero: {hit_up} días</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#ff4757;font-weight:bold;'>🔴 -${daily_limit:,.0f} primero: {hit_down} días</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#6e7191;'>⚪ Sin límite alcanzado: {hit_none} días</span>"
+                f"</div>",
+                unsafe_allow_html=True)
+
         # Grid HTML del calendario
         day_names_es = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
         month_weeks  = cal_lib.monthcalendar(yr_cal, mo_cal)
@@ -1368,6 +1417,7 @@ if "result" in st.session_state:
         for dn in day_names_es:
             cal_html += (f"<div style='text-align:center;color:#6e7191;"
                          f"font-size:12px;font-weight:bold;padding:4px;'>{dn}</div>")
+
         for week in month_weeks:
             for day in week:
                 if day == 0:
@@ -1377,16 +1427,49 @@ if "result" in st.session_state:
                 info = by_date_cal.get(ds)
                 bdr  = ("#00d68f" if ds == best_date_c else
                         ("#ff4757" if ds == worst_date_c else "#1e2236"))
+
                 if info:
                     pv  = info["pnl"]
                     pc  = "#00d68f" if pv > 0 else ("#ff4757" if pv < 0 else "#a0a3b1")
+
+                    # Bloque de límite diario
+                    lim_html = ""
+                    if use_limit and ds in limit_results:
+                        lr = limit_results[ds]
+                        if lr["hit"] == "UP":
+                            lim_html = (
+                                f"<div style='background:#0a2e1e;border-radius:4px;"
+                                f"padding:3px 4px;margin:3px 0;'>"
+                                f"<div style='color:#00d68f;font-size:11px;font-weight:bold;'>"
+                                f"🟢 +${daily_limit:,.0f} primero</div>"
+                                f"<div style='color:#6e7191;font-size:9px;'>"
+                                f"op #{lr['op']} · {lr['time']}</div></div>")
+                            bdr = "#00d68f"
+                        elif lr["hit"] == "DOWN":
+                            lim_html = (
+                                f"<div style='background:#2e0a0a;border-radius:4px;"
+                                f"padding:3px 4px;margin:3px 0;'>"
+                                f"<div style='color:#ff4757;font-size:11px;font-weight:bold;'>"
+                                f"🔴 -${daily_limit:,.0f} primero</div>"
+                                f"<div style='color:#6e7191;font-size:9px;'>"
+                                f"op #{lr['op']} · {lr['time']}</div></div>")
+                            bdr = "#ff4757"
+                        else:
+                            lim_html = (
+                                f"<div style='background:#1e2236;border-radius:4px;"
+                                f"padding:3px 4px;margin:3px 0;'>"
+                                f"<div style='color:#6e7191;font-size:10px;'>⚪ Sin límite</div>"
+                                f"</div>")
+
                     cal_html += (
                         f"<div style='background:#161929;border:2px solid {bdr};"
-                        f"border-radius:8px;padding:8px 4px;text-align:center;min-height:78px;'>"
+                        f"border-radius:8px;padding:8px 4px;text-align:center;"
+                        f"min-height:{'105' if use_limit else '78'}px;'>"
                         f"<div style='color:#6e7191;font-size:10px;text-align:right;'>{day:02d}</div>"
-                        f"<div style='color:{pc};font-size:15px;font-weight:bold;'>${pv:+,.0f}</div>"
+                        f"<div style='color:{pc};font-size:14px;font-weight:bold;'>${pv:+,.0f}</div>"
                         f"<div style='color:#6e7191;font-size:9px;'>"
-                        f"{info['wins']}W/{info['losses']}L·{info['total']}tr</div></div>")
+                        f"{info['wins']}W/{info['losses']}L·{info['total']}tr</div>"
+                        f"{lim_html}</div>")
                 else:
                     cal_html += (
                         f"<div style='background:#0d0f1a;border:1px solid #1e2236;"
@@ -1394,6 +1477,7 @@ if "result" in st.session_state:
                         f"min-height:78px;opacity:0.35;'>"
                         f"<div style='color:#6e7191;font-size:10px;text-align:right;'>{day:02d}</div>"
                         f"<div style='color:#6e7191;font-size:13px;'>—</div></div>")
+
         cal_html += "</div>"
         st.markdown(cal_html, unsafe_allow_html=True)
 
