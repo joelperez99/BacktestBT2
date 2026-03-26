@@ -13,6 +13,8 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 import calendar as cal_lib
 import io
+import sqlite3
+from pathlib import Path
 import plotly.graph_objects as go
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -43,6 +45,195 @@ TIER_COLORS_HEX = {
 }
 _CST_SHIFT = pd.Timedelta(hours=6)
 _CST_DELTA = timedelta(hours=-6)
+
+# ── Base de datos local ────────────────────────────────────────────────────────
+DB_PATH = Path(__file__).parent / "candles.db"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BASE DE DATOS LOCAL (SQLite)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tbl(interval: str) -> str:
+    return "klines_1m" if interval == "1m" else "klines_5m"
+
+
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    for tbl in ("klines_1m", "klines_5m"):
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {tbl} (
+                open_time_ms  INTEGER PRIMARY KEY,
+                open          REAL NOT NULL,
+                high          REAL NOT NULL,
+                low           REAL NOT NULL,
+                close         REAL NOT NULL,
+                volume        REAL NOT NULL,
+                close_time_ms INTEGER NOT NULL
+            )
+        """)
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{tbl}_ot ON {tbl}(open_time_ms)")
+    con.commit()
+    con.close()
+
+
+def get_db_stats(interval: str) -> dict:
+    """Retorna min_ms, max_ms, count para el intervalo dado."""
+    init_db()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        f"SELECT MIN(open_time_ms), MAX(open_time_ms), COUNT(*) FROM {_tbl(interval)}")
+    row = cur.fetchone()
+    con.close()
+    if row and row[2] > 0:
+        return {"min_ms": row[0], "max_ms": row[1], "count": row[2]}
+    return {"min_ms": None, "max_ms": None, "count": 0}
+
+
+def insert_klines_db(interval: str, df: pd.DataFrame):
+    """Inserta un DataFrame de velas en la DB (ignora duplicados)."""
+    if df.empty:
+        return
+    rows = [
+        (int(r["open_time"].value // 1_000_000),
+         float(r["open"]), float(r["high"]), float(r["low"]),
+         float(r["close"]), float(r["volume"]),
+         int(r["close_time"].value // 1_000_000))
+        for _, r in df.iterrows()
+    ]
+    con = sqlite3.connect(DB_PATH)
+    con.executemany(
+        f"INSERT OR IGNORE INTO {_tbl(interval)} "
+        "(open_time_ms,open,high,low,close,volume,close_time_ms) VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+
+
+def load_from_db(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Carga velas de la DB para el rango [start_ms, end_ms)."""
+    init_db()
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        f"SELECT * FROM {_tbl(interval)} "
+        "WHERE open_time_ms >= ? AND open_time_ms < ? ORDER BY open_time_ms",
+        con, params=(start_ms, end_ms),
+    )
+    con.close()
+    if df.empty:
+        return pd.DataFrame()
+    df.rename(columns={"open_time_ms": "open_time", "close_time_ms": "close_time"}, inplace=True)
+    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df.reset_index(drop=True)
+
+
+def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Devuelve velas para [start_ms, end_ms).
+    Usa la DB si están disponibles; sólo descarga de Binance lo que falte.
+    """
+    init_db()
+    stats = get_db_stats(interval)
+    interval_ms = 60_000 if interval == "1m" else 300_000
+
+    missing_start = None
+    missing_end   = None
+
+    if stats["count"] == 0:
+        # DB vacía → descargar todo el rango
+        missing_start, missing_end = start_ms, end_ms
+    else:
+        # Verificar si falta el inicio del rango
+        if stats["min_ms"] > start_ms:
+            missing_start = start_ms
+            missing_end   = stats["min_ms"]
+            # Fetch tramo inicial faltante
+            new_df = fetch_klines_range(interval, missing_start, missing_end)
+            if not new_df.empty:
+                insert_klines_db(interval, new_df)
+
+        # Verificar si falta el final del rango
+        if stats["max_ms"] < end_ms - interval_ms:
+            fetch_from = max(stats["max_ms"] + 1, start_ms)
+            new_df = fetch_klines_range(interval, fetch_from, end_ms)
+            if not new_df.empty:
+                insert_klines_db(interval, new_df)
+
+    if missing_start is not None and missing_end is not None:
+        new_df = fetch_klines_range(interval, missing_start, missing_end)
+        if not new_df.empty:
+            insert_klines_db(interval, new_df)
+
+    return load_from_db(interval, start_ms, end_ms)
+
+
+def update_db(progress_cb=None) -> dict:
+    """Descarga sólo las velas nuevas desde el último timestamp almacenado hasta ahora."""
+    init_db()
+    now_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    updated  = {"1m": 0, "5m": 0}
+
+    for interval in ("1m", "5m"):
+        stats = get_db_stats(interval)
+        if stats["max_ms"] is None:
+            if progress_cb:
+                progress_cb(f"DB vacía para {interval} — usa 'Descargar Historia' primero")
+            continue
+        fetch_from = stats["max_ms"] + 1
+        if fetch_from >= now_ms:
+            continue
+        new_df = fetch_klines_range(interval, fetch_from, now_ms)
+        if not new_df.empty:
+            insert_klines_db(interval, new_df)
+            updated[interval] = len(new_df)
+        if progress_cb:
+            progress_cb(f"{interval}: +{updated[interval]} velas nuevas")
+
+    return updated
+
+
+def download_history(start_year: int = 2024, progress_cb=None) -> dict:
+    """Descarga historia completa desde start_year hasta hoy para 1m y 5m."""
+    init_db()
+    start_ms = int(pd.Timestamp(year=start_year, month=1, day=1, tz="UTC").value // 1_000_000)
+    now_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    counts   = {"1m": 0, "5m": 0}
+
+    for interval in ("1m", "5m"):
+        if progress_cb:
+            progress_cb(f"Descargando {interval}…", 0.0)
+        stats = get_db_stats(interval)
+
+        # Tramos faltantes: antes del mínimo almacenado
+        if stats["min_ms"] is None or stats["min_ms"] > start_ms:
+            fetch_to = stats["min_ms"] if stats["min_ms"] else now_ms
+            new_df = fetch_klines_range(interval, start_ms, fetch_to)
+            if not new_df.empty:
+                insert_klines_db(interval, new_df)
+                counts[interval] += len(new_df)
+            if progress_cb:
+                progress_cb(f"{interval}: historia inicial descargada ({counts[interval]} velas)", 0.4)
+
+        # Tramos faltantes: después del máximo almacenado
+        stats2 = get_db_stats(interval)
+        if stats2["max_ms"] and stats2["max_ms"] < now_ms - (300_000 if interval == "5m" else 60_000):
+            new_df = fetch_klines_range(interval, stats2["max_ms"] + 1, now_ms)
+            if not new_df.empty:
+                insert_klines_db(interval, new_df)
+                counts[interval] += len(new_df)
+            if progress_cb:
+                progress_cb(f"{interval}: actualizado hasta hoy ({counts[interval]} velas nuevas)", 0.9)
+
+        if progress_cb:
+            final_stats = get_db_stats(interval)
+            progress_cb(
+                f"{interval} listo — {final_stats['count']:,} velas en DB",
+                1.0 if interval == "5m" else 0.5)
+
+    return counts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -480,8 +671,8 @@ def run_backtest(date_str: str, filters: dict) -> dict:
     start_ms = int(warmup_start.value // 1_000_000)
     end_ms   = int(fetch_end.value    // 1_000_000)
 
-    df1m = fetch_klines_range("1m", start_ms, end_ms)
-    df5m = fetch_klines_range("5m", start_ms, end_ms)
+    df1m = fetch_and_cache("1m", start_ms, end_ms)
+    df5m = fetch_and_cache("5m", start_ms, end_ms)
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para esa fecha.")
 
@@ -516,8 +707,8 @@ def run_backtest_month(year_str: str, month_str: str, filters: dict,
     start_ms = int(warmup_start.value // 1_000_000)
     end_ms   = int(fetch_end.value    // 1_000_000)
 
-    df1m = fetch_klines_range("1m", start_ms, end_ms)
-    df5m = fetch_klines_range("5m", start_ms, end_ms)
+    df1m = fetch_and_cache("1m", start_ms, end_ms)
+    df5m = fetch_and_cache("5m", start_ms, end_ms)
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para ese mes.")
 
@@ -868,6 +1059,31 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("▶  Ejecutar Backtest", use_container_width=True, type="primary")
 
+    # ── Base de datos ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("**💾 Base de datos local**")
+
+    stats_1m = get_db_stats("1m")
+    stats_5m = get_db_stats("5m")
+
+    def _fmt_ms(ms):
+        if ms is None: return "—"
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    st.markdown(
+        f"<div style='font-size:11px;color:#8a8daa;line-height:1.8;'>"
+        f"🕐 1m: <b style='color:#e8eaf6;'>{stats_1m['count']:,}</b> velas"
+        f" &nbsp;|&nbsp; {_fmt_ms(stats_1m['min_ms'])} → {_fmt_ms(stats_1m['max_ms'])}<br>"
+        f"📊 5m: <b style='color:#e8eaf6;'>{stats_5m['count']:,}</b> velas"
+        f" &nbsp;|&nbsp; {_fmt_ms(stats_5m['min_ms'])} → {_fmt_ms(stats_5m['max_ms'])}"
+        f"</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    hist_btn   = st.button("📥 Descargar Historia (2024–hoy)",
+                            use_container_width=True, key="btn_hist")
+    update_btn = st.button("🔄 Actualizar velas nuevas",
+                            use_container_width=True, key="btn_update")
+
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style='display:flex;align-items:center;gap:14px;margin-bottom:10px;'>
@@ -892,6 +1108,47 @@ filters = {
     "allowed_hours":  None,
     "min_confidence": None,
 }
+
+# ── Descargar historia ────────────────────────────────────────────────────────
+if hist_btn:
+    status_box = st.empty()
+    prog_bar   = st.progress(0.0, text="Iniciando descarga…")
+    log_lines  = []
+
+    def _hist_cb(msg, pct):
+        log_lines.append(msg)
+        prog_bar.progress(min(pct, 1.0), text=msg)
+        status_box.markdown(
+            "<br>".join(f"• {l}" for l in log_lines[-6:]),
+            unsafe_allow_html=True)
+
+    try:
+        counts = download_history(start_year=2024, progress_cb=_hist_cb)
+        prog_bar.progress(1.0, text="✅ Descarga completa")
+        st.success(
+            f"Historia descargada — 1m: +{counts['1m']:,} velas nuevas  |  "
+            f"5m: +{counts['5m']:,} velas nuevas")
+        st.rerun()
+    except Exception as e:
+        prog_bar.empty()
+        st.error(f"Error durante la descarga: {e}")
+
+# ── Actualizar velas nuevas ───────────────────────────────────────────────────
+if update_btn:
+    msgs = []
+    with st.spinner("Actualizando velas nuevas desde Binance…"):
+        try:
+            def _upd_cb(msg): msgs.append(msg)
+            counts = update_db(progress_cb=_upd_cb)
+            total  = counts["1m"] + counts["5m"]
+            if total == 0:
+                st.info("La DB ya está al día. No hay velas nuevas.")
+            else:
+                st.success(
+                    f"✅ Actualización completa — 1m: +{counts['1m']:,}  |  5m: +{counts['5m']:,}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error al actualizar: {e}")
 
 if run_btn:
     if mode == "Por día":
