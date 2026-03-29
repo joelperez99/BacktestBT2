@@ -425,7 +425,8 @@ def _process_candles(df5m_range: pd.DataFrame, df1m_full: pd.DataFrame,
 
         tier   = get_trade_tier(sig_vol, sig_move)
         c_open = c5["close_time"]
-        hour   = c_open.to_pydatetime().astimezone().hour
+        _CST_TZ = timezone(_CST_DELTA)
+        hour   = c_open.to_pydatetime().astimezone(_CST_TZ).hour
         in_flt = passes_filter(sig_vol, sig_move, hour, conf, filters)
 
         m1s = df1m_full[
@@ -439,8 +440,9 @@ def _process_candles(df5m_range: pd.DataFrame, df1m_full: pd.DataFrame,
             min_correct[mn] = ("UP" if mc >= open_price else "DOWN") == direction
 
         sigs = "|".join(f"{v[0]}:{v[1]}" for v in votes)
-        loc  = c5_next["open_time"].to_pydatetime().astimezone()
+        _CST_TZ = timezone(_CST_DELTA)          # UTC-6 fijo, igual que desktop
         utc  = c5_next["open_time"].to_pydatetime()
+        loc  = utc.astimezone(_CST_TZ)
 
         results.append({
             "date":            loc.strftime("%Y-%m-%d"),
