@@ -669,8 +669,8 @@ def run_backtest(date_str: str, filters: dict) -> dict:
     start_ms = int(warmup_start.value // 1_000_000)
     end_ms   = int(fetch_end.value    // 1_000_000)
 
-    df1m = fetch_and_cache("1m", start_ms, end_ms)
-    df5m = fetch_and_cache("5m", start_ms, end_ms)
+    df1m = fetch_klines_range("1m", start_ms, end_ms)
+    df5m = fetch_klines_range("5m", start_ms, end_ms)
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para esa fecha.")
 
@@ -707,8 +707,8 @@ def run_backtest_month(year_str: str, month_str: str, filters: dict,
     start_ms = int(warmup_start.value // 1_000_000)
     end_ms   = int(fetch_end.value    // 1_000_000)
 
-    df1m = fetch_and_cache("1m", start_ms, end_ms)
-    df5m = fetch_and_cache("5m", start_ms, end_ms)
+    df1m = fetch_klines_range("1m", start_ms, end_ms)
+    df5m = fetch_klines_range("5m", start_ms, end_ms)
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para ese mes.")
 
@@ -748,8 +748,8 @@ def run_backtest_year(year_str: str, filters: dict, progress_cb=None) -> dict:
 
     if progress_cb:
         progress_cb("Cargando datos 1m y 5m del año…", 0.02)
-    df1m = fetch_and_cache("1m", start_ms, end_ms)
-    df5m = fetch_and_cache("5m", start_ms, end_ms)
+    df1m = fetch_klines_range("1m", start_ms, end_ms)
+    df5m = fetch_klines_range("5m", start_ms, end_ms)
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para ese año.")
 
