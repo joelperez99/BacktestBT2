@@ -697,12 +697,13 @@ def run_backtest(date_str: str, filters: dict) -> dict:
 def run_backtest_month(year_str: str, month_str: str, filters: dict,
                        progress_cb=None) -> dict:
     year  = int(year_str); month = int(month_str)
-    # Usar medianoche CST = 06:00 UTC como límite de día (igual que run_backtest)
-    month_start_cst = pd.Timestamp(year=year, month=month, day=1, tz="UTC") + _CST_SHIFT
-    last_day        = cal_lib.monthrange(year, month)[1]
-    month_end_cst   = month_start_cst + pd.Timedelta(days=last_day)
-    warmup_start    = month_start_cst - pd.Timedelta(hours=2)
-    fetch_end       = month_end_cst   + pd.Timedelta(minutes=10)
+    # Ventanas alineadas a UTC (igual que desktop btc_backtest_v2.py).
+    # La asignación de fecha CST ocurre en _process_candles con timezone UTC-6 explícito.
+    month_start  = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
+    last_day     = cal_lib.monthrange(year, month)[1]
+    month_end    = month_start + pd.Timedelta(days=last_day)
+    warmup_start = month_start - pd.Timedelta(hours=2)
+    fetch_end    = month_end   + pd.Timedelta(minutes=10)
     start_ms = int(warmup_start.value // 1_000_000)
     end_ms   = int(fetch_end.value    // 1_000_000)
 
@@ -711,11 +712,11 @@ def run_backtest_month(year_str: str, month_str: str, filters: dict,
     if df1m.empty or df5m.empty:
         raise ValueError("No se obtuvieron datos para ese mes.")
 
-    df5m_month = df5m[(df5m["open_time"] >= month_start_cst) &
+    df5m_month = df5m[(df5m["open_time"] >= month_start) &
                       (df5m["open_time"] <  fetch_end)].reset_index(drop=True)
     all_records = []
     for idx in range(last_day):
-        day_ts     = month_start_cst + pd.Timedelta(days=idx)
+        day_ts     = month_start + pd.Timedelta(days=idx)
         day_end_ts = day_ts + pd.Timedelta(days=1)
         df5m_day = df5m_month[
             (df5m_month["open_time"] >= day_ts) &
@@ -737,9 +738,9 @@ def run_backtest_month(year_str: str, month_str: str, filters: dict,
 
 def run_backtest_year(year_str: str, filters: dict, progress_cb=None) -> dict:
     year         = int(year_str)
-    # Alinear con CST: el año empieza a las 06:00 UTC del 1 Ene (= medianoche CST)
-    year_start   = pd.Timestamp(year=year, month=1, day=1, tz="UTC") + _CST_SHIFT
-    year_end     = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC") + _CST_SHIFT
+    # Ventanas alineadas a UTC (igual que desktop). Fecha CST asignada en _process_candles.
+    year_start   = pd.Timestamp(year=year, month=1, day=1, tz="UTC")
+    year_end     = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
     warmup_start = year_start - pd.Timedelta(hours=2)
     fetch_end    = year_end   + pd.Timedelta(minutes=10)
     start_ms     = int(warmup_start.value // 1_000_000)
@@ -754,18 +755,17 @@ def run_backtest_year(year_str: str, filters: dict, progress_cb=None) -> dict:
 
     all_records = []
     for month in range(1, 13):
-        # Usar medianoche CST = 06:00 UTC (igual que run_backtest y run_backtest_month)
-        month_start_cst = pd.Timestamp(year=year, month=month, day=1, tz="UTC") + _CST_SHIFT
-        last_day        = cal_lib.monthrange(year, month)[1]
-        month_end_cst   = month_start_cst + pd.Timedelta(days=last_day)
+        month_start = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
+        last_day    = cal_lib.monthrange(year, month)[1]
+        month_end_t = month_start + pd.Timedelta(days=last_day)
 
         df5m_month = df5m[
-            (df5m["open_time"] >= month_start_cst) &
-            (df5m["open_time"] <  month_end_cst + pd.Timedelta(minutes=10))
+            (df5m["open_time"] >= month_start) &
+            (df5m["open_time"] <  month_end_t + pd.Timedelta(minutes=10))
         ].reset_index(drop=True)
 
         for idx in range(last_day):
-            day_ts     = month_start_cst + pd.Timedelta(days=idx)
+            day_ts     = month_start + pd.Timedelta(days=idx)
             day_end_ts = day_ts + pd.Timedelta(days=1)
             df5m_day   = df5m_month[
                 (df5m_month["open_time"] >= day_ts) &
